@@ -1,64 +1,131 @@
-// Эти директивы подключают конфигурационные файлы.
+#pragma once
 #include "../config.hpp"
 #include "../macro.hpp"
 
-// Если определены директивы GH_ESP_BUILD и GH_NO_MQTT, то используется "пустой" класс
 #ifdef GH_ESP_BUILD
 #ifdef GH_NO_MQTT
 class HubMQTT {
    public:
     void setupMQTT(const char* host, uint16_t port, const char* login = nullptr, const char* pass = nullptr, uint8_t nqos = 0, bool nret = 0) {}
 };
-#else  // GH_NO_MQTT не определен, поэтому используем реальную реализацию
+#else
 
-// Подключаем необходимые библиотеки
 #include <Arduino.h>
 #include <AsyncMqttClient.h>
+
 #include "../utils/stats.h"
 
 class HubMQTT {
+    // ============ PUBLIC =============
    public:
-    // Функции для настройки MQTT соединения
+    // настроить MQTT (хост брокера, порт, логин, пароль, QoS, retained)
     void setupMQTT(const char* host, uint16_t port, const char* login = nullptr, const char* pass = nullptr, uint8_t nqos = 0, bool nret = 0) {
-        if (!strlen(host)) return;  // Проверка на пустой хост
-        mqtt.setServer(host, port);  // Установка сервера
-        _setupMQTT(login, pass, nqos, nret);  // Приватный метод для дополнительных настроек
+        if (!strlen(host)) return;
+        mqtt.setServer(host, port);
+        _setupMQTT(login, pass, nqos, nret);
     }
-
-    // Перегрузка для IP-адреса
     void setupMQTT(IPAddress ip, uint16_t port, const char* login = nullptr, const char* pass = nullptr, uint8_t nqos = 0, bool nret = 0) {
         mqtt.setServer(ip, port);
         _setupMQTT(login, pass, nqos, nret);
     }
 
-    // Проверка состояния подключения
+    // MQTT подключен
     bool online() {
         return mqtt.connected();
     }
 
+    // ============ PROTECTED =============
    protected:
-    // Виртуальные методы, должны быть реализованы в наследуемых классах
     virtual void parse(char* url, char* value, GHconn_t from) = 0;
     virtual const char* getPrefix() = 0;
     virtual const char* getID() = 0;
     virtual void sendEvent(GHevent_t state, GHconn_t from) = 0;
 
-    // Методы для управления MQTT соединением
     void beginMQTT() {
-        // Здесь идет настройка обработчиков событий для MQTT
-        // Например, при успешном подключении, определенные топики подписываются
+        mqtt.onConnect([this](GH_UNUSED bool pres) {
+            String sub_topic(getPrefix());
+            mqtt.subscribe(sub_topic.c_str(), qos);
+
+            sub_topic += '/';
+            sub_topic += getID();
+            sub_topic += "/#";
+            mqtt.subscribe(sub_topic.c_str(), qos);
+
+            String status(getPrefix());
+            status += F("/hub/");
+            status += getID();
+            status += F("/status");
+            String offline(F("offline"));
+            mqtt.setWill(status.c_str(), qos, ret, offline.c_str());
+
+            String online(F("online"));
+            sendMQTT(status, online);
+            sendEvent(GH_CONNECTED, GH_MQTT);
+            mqtt_tmr = millis();
+        });
+
+        mqtt.onDisconnect([this](GH_UNUSED AsyncMqttClientDisconnectReason reason) {
+            String m_id("DEV-");
+            m_id += String(random(0xffffff), HEX);
+            mqtt.setClientId(m_id.c_str());
+            sendEvent(GH_DISCONNECTED, GH_MQTT);
+            mqtt_tmr = millis();
+        });
+
+        mqtt.onMessage([this](char* topic, char* data, GH_UNUSED AsyncMqttClientMessageProperties prop, size_t len, GH_UNUSED size_t index, GH_UNUSED size_t total) {
+            char buf[len + 1];
+            memcpy(buf, data, len);
+            buf[len] = 0;
+            parse(topic, buf, GH_MQTT);
+        });
     }
 
-    // Отключение от MQTT
     void endMQTT() {
         mqtt.disconnect();
     }
 
-    // Дополнительные приватные методы и переменные
+    void tickMQTT() {
+        if (mq_configured && !mqtt.connected() && (!mqtt_tmr || millis() - mqtt_tmr > GH_MQTT_RECONNECT)) {
+            mqtt_tmr = millis();
+            sendEvent(GH_CONNECTING, GH_MQTT);
+            mqtt.connect();
+        }
+    }
+
+    void sendMQTT(const String& topic, const String& msg) {
+        if (mqtt.connected()) mqtt.publish(topic.c_str(), qos, ret, msg.c_str(), msg.length());
+    }
+
+    void sendMQTT(const String& msg) {
+        String topic(getPrefix());
+        topic += F("/hub");
+        sendMQTT(topic, msg);
+    }
+
+    void answerMQTT(const String& msg, const char* hubID) {
+        String topic(getPrefix());
+        topic += F("/hub/");
+        topic += hubID;
+        topic += '/';
+        topic += getID();
+        sendMQTT(topic, msg);
+    }
+
+    // ============ PRIVATE =============
    private:
     void _setupMQTT(const char* login, const char* pass, uint8_t nqos, bool nret) {
-        // Дополнительные настройки для MQTT
+        if (mqtt.connected()) mqtt.disconnect();
+        mqtt.setCredentials(login, pass);
+        qos = nqos;
+        ret = nret;
+        mq_configured = true;
     }
+
+    AsyncMqttClient mqtt;
+    bool mq_configured = false;
+    uint32_t mqtt_tmr = 0;
+    uint8_t qos = 0;
+    bool ret = 0;
 };
 #endif
 #endif
